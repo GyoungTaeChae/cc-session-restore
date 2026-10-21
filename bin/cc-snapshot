@@ -4,11 +4,15 @@
 #   cc-snapshot           write the snapshot file
 #   cc-snapshot --print   print the open sessions as JSON, write nothing
 #   cc-snapshot --notify  also report the result as a desktop notification
+# Every snapshot is also kept under history/ for 3 days, so a crash cannot wipe
+# the list of sessions that were open right before it.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 SNAPSHOT_DIR="${CLAUDE_SESSIONS_DIR:-@SESSIONS_DIR@}"
 SNAPSHOT_FILE="$SNAPSHOT_DIR/open-sessions.json"
+HISTORY_DIR="$SNAPSHOT_DIR/history"
+HISTORY_KEEP_MINUTES=4320
 REGISTRY_DIR="$HOME/.claude/sessions"
 NOTIFY_ICON="cc-session-restore"
 
@@ -41,7 +45,7 @@ collect_open_sessions() {
     # the terminator terminal this session runs in, matched against the layout by cc-restore
     terminal_uuid=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^TERMINATOR_UUID=//p' || true)
     jq --arg terminalUuid "$terminal_uuid" '{sessionId, cwd, name, pid, startedAt, terminalUuid: $terminalUuid}' "$registry_file"
-  done | jq -s 'sort_by(.startedAt)'
+  done | jq -s 'unique_by(.sessionId) | sort_by(.startedAt)'
 }
 
 open_sessions=$(collect_open_sessions)
@@ -60,12 +64,13 @@ if [ "$count" -eq 0 ]; then
   exit 0
 fi
 
-mkdir -p "$SNAPSHOT_DIR"
-[ -f "$SNAPSHOT_FILE" ] && cp "$SNAPSHOT_FILE" "$SNAPSHOT_FILE.prev"
-
+mkdir -p "$HISTORY_DIR"
+history_file="$HISTORY_DIR/$(date +%Y%m%d-%H%M%S).json"
 printf '%s' "$open_sessions" \
   | jq --arg savedAt "$(date -Iseconds)" '{savedAt: $savedAt, sessions: .}' \
-  > "$SNAPSHOT_FILE"
+  > "$history_file"
+cp "$history_file" "$SNAPSHOT_FILE"
+find "$HISTORY_DIR" -name '*.json' -mmin +"$HISTORY_KEEP_MINUTES" -delete
 
 echo "cc-snapshot: saved $count session(s) -> $SNAPSHOT_FILE"
 send_notice "$count 개 세션을 기록했습니다."

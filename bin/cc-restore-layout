@@ -1,39 +1,131 @@
 #!/usr/bin/env python3
-# cc-restore-layout — turn the layout saved by the terminator LayoutSnapshot plugin
-# into a terminator layout named "claude_restore" inside ~/.config/terminator/config.
-# Terminals that held a Claude session get "claude --resume <id>" as their command.
-# Prints the session ids it placed, one per line, so cc-restore can open the rest as tabs.
-#   cc-restore-layout <open-sessions.json> <terminator-layout.json>
+# cc-restore-layout — the decisions behind cc-restore.
+#   cc-restore-layout candidates <snapshot dir> <terminator running: 0|1>  < running-sessions.json
+#       print the sessions worth reopening as TSV: preselected, sessionId, name, last seen, cwd
+#   cc-restore-layout build <snapshot dir> <layout|tabs|windows> <terminator running: 0|1> <sessionId>...
+#       write those sessions as the terminator layout "claude_restore" in ~/.config/terminator/config
+#       and print the layout file it followed, if any
+import glob
 import json
 import os
 import shlex
 import shutil
 import sys
+import time
+from operator import itemgetter
 
 from configobj import ConfigObj
 
 LAYOUT_NAME = 'claude_restore'
 TERMINATOR_CONFIG = os.path.expanduser('~/.config/terminator/config')
+CANDIDATE_HOURS = 24
 
 
 def plain_uuid(uuid_text):
-    return uuid_text.replace('urn:uuid:', '')
+    return (uuid_text or '').replace('urn:uuid:', '')
 
 
-def main():
-    sessions_file, layout_file = sys.argv[1], sys.argv[2]
-    with open(sessions_file) as sessions_input:
-        sessions = json.load(sessions_input)['sessions']
-    with open(layout_file) as layout_input:
-        layout = json.load(layout_input)
+def file_time(path):
+    # history and layout files start with YYYYmmdd-HHMMSS
+    return time.mktime(time.strptime(os.path.basename(path)[:15], '%Y%m%d-%H%M%S'))
 
-    session_by_terminal = {}
-    for session in sessions:
-        if session.get('terminalUuid'):
-            session_by_terminal[plain_uuid(session['terminalUuid'])] = session
 
-    placed_session_ids = []
-    for child in layout.values():
+def load_json(path):
+    try:
+        with open(path) as input_file:
+            return json.load(input_file)
+    except (OSError, ValueError):
+        return None
+
+
+def load_history(snapshot_dir):
+    """Return [(path, sessions)] oldest first."""
+    history = []
+    for path in sorted(glob.glob(os.path.join(snapshot_dir, 'history', '*.json'))):
+        snapshot = load_json(path)
+        if snapshot and snapshot.get('sessions'):
+            history.append((path, snapshot['sessions']))
+    if not history:
+        # snapshot written before history/ existed
+        snapshot = load_json(os.path.join(snapshot_dir, 'open-sessions.json'))
+        if snapshot and snapshot.get('sessions'):
+            history.append((os.path.join(snapshot_dir, 'open-sessions.json'), snapshot['sessions']))
+    return history
+
+
+def print_candidates(snapshot_dir, terminator_running):
+    running_ids = {session['sessionId'] for session in json.load(sys.stdin)}
+    history = load_history(snapshot_dir)
+    if not history:
+        return
+
+    if not terminator_running:
+        # nothing is open (reboot, or every window was closed): bring back the last snapshot
+        path, sessions = history[-1]
+        for session in sessions:
+            if session['sessionId'] not in running_ids and os.path.isdir(session['cwd']):
+                print_row(True, session, path)
+        return
+
+    # terminator is open, so something closed part of it: offer every session seen in the
+    # last day that is not running now, and preselect the ones that vanished most recently
+    last_seen = {}
+    for path, sessions in history:
+        for session in sessions:
+            last_seen[session['sessionId']] = (path, session)
+    newest_cutoff = time.time() - CANDIDATE_HOURS * 3600
+    missing = []
+    for session_id, (path, session) in last_seen.items():
+        if session_id in running_ids or not os.path.isdir(session['cwd']):
+            continue
+        if path.endswith('open-sessions.json') or file_time(path) >= newest_cutoff:
+            missing.append((path, session))
+    missing.sort(key=itemgetter(0), reverse=True)
+    if not missing:
+        return
+    newest_path = missing[0][0]
+    for path, session in missing:
+        print_row(path == newest_path, session, path)
+
+
+def print_row(preselected, session, path):
+    if path.endswith('open-sessions.json'):
+        seen = '-'
+    else:
+        seen = time.strftime('%m-%d %H:%M', time.localtime(file_time(path)))
+    print('\t'.join(['TRUE' if preselected else 'FALSE', session['sessionId'],
+                     session.get('name') or 'claude', seen, session['cwd']]))
+
+
+def resume_command(session):
+    return 'claude --resume %s; exec bash' % shlex.quote(session['sessionId'])
+
+
+def window_of(name, layout):
+    while layout[name]['type'] != 'Window':
+        name = layout[name]['parent']
+    return name
+
+
+def find_layout(snapshot_dir, sessions):
+    """Newest saved layout that held at least one of these sessions' terminals."""
+    wanted_uuids = {plain_uuid(session.get('terminalUuid')) for session in sessions} - {''}
+    for path in sorted(glob.glob(os.path.join(snapshot_dir, 'layouts', '*.json')), reverse=True):
+        layout = load_json(path)
+        if not layout:
+            continue
+        layout_uuids = {plain_uuid(child.get('uuid')) for child in layout.values()}
+        if wanted_uuids & layout_uuids:
+            return path, layout
+    return None, None
+
+
+def fill_saved_layout(layout, sessions, terminator_running):
+    """Put resume commands into a saved layout; return the session ids it placed."""
+    session_by_terminal = {plain_uuid(session.get('terminalUuid')): session for session in sessions}
+    placed_ids = set()
+    windows_with_sessions = set()
+    for name, child in layout.items():
         # a forced window title would stop the title from following the running program
         if child['type'] == 'Window':
             child.pop('title', None)
@@ -41,13 +133,63 @@ def main():
             continue
         if child.get('directory') and not os.path.isdir(child['directory']):
             del child['directory']
-        session = session_by_terminal.get(plain_uuid(child.get('uuid', '')))
-        if session is None or not os.path.isdir(session['cwd']):
+        session = session_by_terminal.get(plain_uuid(child.get('uuid')))
+        if session is None:
             continue
         # claude --resume only works from the directory the session was started in
         child['directory'] = session['cwd']
-        child['command'] = 'claude --resume %s; exec bash' % shlex.quote(session['sessionId'])
-        placed_session_ids.append(session['sessionId'])
+        child['command'] = resume_command(session)
+        placed_ids.add(session['sessionId'])
+        windows_with_sessions.add(window_of(name, layout))
+
+    if terminator_running:
+        # the other windows of that layout are most likely still open
+        unused_names = [name for name in layout if window_of(name, layout) not in windows_with_sessions]
+        for name in unused_names:
+            del layout[name]
+    return placed_ids
+
+
+def add_session_windows(layout, sessions, style):
+    """Open sessions that had no saved layout: one window of tabs, or one window each."""
+    if style == 'windows':
+        groups = [[session] for session in sessions]
+    else:
+        groups = [sessions]
+    for window_number, group in enumerate(groups):
+        window_name = 'extra_window%d' % window_number
+        layout[window_name] = {'type': 'Window', 'parent': ''}
+        parent = window_name
+        if len(group) > 1:
+            parent = 'extra_tabs%d' % window_number
+            layout[parent] = {'type': 'Notebook', 'parent': window_name, 'order': 0,
+                              'labels': [session.get('name') or 'claude' for session in group]}
+        for order, session in enumerate(group):
+            layout['extra_terminal%d_%d' % (window_number, order)] = {
+                'type': 'Terminal', 'parent': parent, 'order': order,
+                'directory': session['cwd'], 'command': resume_command(session)}
+
+
+def build(snapshot_dir, style, terminator_running, session_ids):
+    latest_record = {}
+    for path, sessions in load_history(snapshot_dir):
+        for session in sessions:
+            latest_record[session['sessionId']] = session
+    sessions = [latest_record[session_id] for session_id in session_ids if session_id in latest_record]
+    if not sessions:
+        sys.exit('no known session among: %s' % ' '.join(session_ids))
+
+    layout = {}
+    placed_ids = set()
+    if style == 'layout':
+        layout_path, saved_layout = find_layout(snapshot_dir, sessions)
+        if saved_layout:
+            print(layout_path)
+            placed_ids = fill_saved_layout(saved_layout, sessions, terminator_running)
+            layout.update(saved_layout)
+    rest = [session for session in sessions if session['sessionId'] not in placed_ids]
+    if rest:
+        add_session_windows(layout, rest, style)
 
     if os.path.exists(TERMINATOR_CONFIG):
         shutil.copy(TERMINATOR_CONFIG, TERMINATOR_CONFIG + '.bak-cc-restore')
@@ -57,8 +199,15 @@ def main():
     config['layouts'][LAYOUT_NAME] = layout
     config.write()
 
-    for session_id in placed_session_ids:
-        print(session_id)
+
+def main():
+    command, snapshot_dir = sys.argv[1], sys.argv[2]
+    if command == 'candidates':
+        print_candidates(snapshot_dir, sys.argv[3] == '1')
+    elif command == 'build':
+        build(snapshot_dir, sys.argv[3], sys.argv[4] == '1', sys.argv[5:])
+    else:
+        sys.exit('unknown command: %s' % command)
 
 
 if __name__ == '__main__':

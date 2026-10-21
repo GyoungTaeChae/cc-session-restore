@@ -14,13 +14,13 @@ ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 DESKTOP_FILE="cc-session-restore.desktop"
 
 missing=()
-for command_name in jq terminator python3 systemctl; do
+for command_name in jq terminator python3 systemctl zenity; do
   command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
 done
 python3 -c 'import configobj' 2>/dev/null || missing+=("python3-configobj")
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "missing: ${missing[*]}" >&2
-  echo "on Ubuntu: sudo apt install jq terminator python3-configobj" >&2
+  echo "on Ubuntu: sudo apt install jq terminator python3-configobj zenity" >&2
   exit 1
 fi
 

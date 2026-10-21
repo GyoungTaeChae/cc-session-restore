@@ -1,7 +1,9 @@
 # layout_snapshot — save the full terminator layout (windows, tab order,
 # splits, each terminal's uuid and cwd) every 10 minutes for cc-restore.
+# Each save is a new file kept for 3 days, so a closed window can still be found.
 import json
 import os
+import time
 
 from gi.repository import GLib
 
@@ -12,8 +14,9 @@ from terminatorlib.util import err
 AVAILABLE = ['LayoutSnapshot']
 
 SNAPSHOT_DIR = os.environ.get('CLAUDE_SESSIONS_DIR', '@SESSIONS_DIR@')
-SNAPSHOT_FILE = os.path.join(SNAPSHOT_DIR, 'terminator-layout.json')
+LAYOUT_DIR = os.path.join(SNAPSHOT_DIR, 'layouts')
 SAVE_INTERVAL_SECONDS = 600
+KEEP_SECONDS = 3 * 24 * 3600
 
 
 class LayoutSnapshot(plugin.Plugin):
@@ -30,11 +33,15 @@ class LayoutSnapshot(plugin.Plugin):
         try:
             layout = Terminator().describe_layout(save_cwd=True)
             if layout:
-                os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-                temporary_file = SNAPSHOT_FILE + '.tmp'
-                with open(temporary_file, 'w') as output:
+                os.makedirs(LAYOUT_DIR, exist_ok=True)
+                layout_file = os.path.join(LAYOUT_DIR, '%s-%d.json' % (time.strftime('%Y%m%d-%H%M%S'), os.getpid()))
+                with open(layout_file + '.tmp', 'w') as output:
                     json.dump(layout, output, indent=2, default=str)
-                os.replace(temporary_file, SNAPSHOT_FILE)
+                os.replace(layout_file + '.tmp', layout_file)
+            for name in os.listdir(LAYOUT_DIR):
+                path = os.path.join(LAYOUT_DIR, name)
+                if time.time() - os.path.getmtime(path) > KEEP_SECONDS:
+                    os.remove(path)
         except Exception as error:
             err('LayoutSnapshot: saving layout failed: %s' % error)
         # returning True keeps the GLib timer running
