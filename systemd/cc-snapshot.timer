@@ -1,0 +1,10 @@
+[Unit]
+Description=Record open Claude Code sessions every 10 minutes
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

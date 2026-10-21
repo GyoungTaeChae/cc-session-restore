@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# cc-restore — reopen the sessions recorded by cc-snapshot.
+#   cc-restore            rebuild the saved terminator layout (windows, tabs, splits)
+#                         with each Claude session resumed in its old place; falls back
+#                         to tabs when no layout is saved or terminator is already open
+#   cc-restore --tabs     ignore the layout, one tab per session
+#   cc-restore --list     just print what the snapshot holds
+#   cc-restore --windows  one separate window per session instead of tabs
+#   cc-restore --notify   also report the result as a desktop notification
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+SNAPSHOT_DIR="${CLAUDE_SESSIONS_DIR:-@SESSIONS_DIR@}"
+SNAPSHOT_FILE="$SNAPSHOT_DIR/open-sessions.json"
+LAYOUT_FILE="$SNAPSHOT_DIR/terminator-layout.json"
+NOTIFY_ICON="cc-session-restore"
+
+mode="layout"
+notify="no"
+for arg in "$@"; do
+  case "$arg" in
+    --list) mode="list" ;;
+    --tabs) mode="tabs" ;;
+    --windows) mode="windows" ;;
+    --notify) notify="yes" ;;
+    *) echo "usage: cc-restore [--list|--tabs|--windows] [--notify]" >&2; exit 1 ;;
+  esac
+done
+
+send_notice() {
+  [ "$notify" = "yes" ] || return 0
+  command -v notify-send >/dev/null 2>&1 && notify-send -i "$NOTIFY_ICON" "Claude 세션" "$1"
+  # notification banners are turned off on this desktop, so show a window too
+  if [ "$(gsettings get org.gnome.desktop.notifications show-banners 2>/dev/null)" = "false" ] \
+     && command -v zenity >/dev/null 2>&1; then
+    zenity --info --title="Claude 세션" --text="$1" --width=360 --timeout=8 >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+if [ ! -f "$SNAPSHOT_FILE" ]; then
+  echo "no snapshot at $SNAPSHOT_FILE — run cc-snapshot while sessions are open" >&2
+  send_notice "저장된 세션 기록이 없습니다. 세션이 열려 있을 때 cc-snapshot 을 실행하세요."
+  exit 1
+fi
+
+saved_at=$(jq -r '.savedAt' "$SNAPSHOT_FILE")
+echo "--- $(date '+%F %T') cc-restore, snapshot from $saved_at"
+
+mapfile -t rows < <(jq -r '.sessions[] | [.sessionId, .cwd, (.name // "claude")] | @tsv' "$SNAPSHOT_FILE")
+if [ "${#rows[@]}" -eq 0 ]; then
+  echo "snapshot is empty" >&2
+  send_notice "저장된 세션 기록이 비어 있습니다."
+  exit 1
+fi
+
+already_open=$(cc-snapshot --print | jq -r '.[].sessionId')
+
+if [ "$mode" = "list" ]; then
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r session_id session_cwd session_name <<<"$row"
+    printf '  %-22s %s\n        %s\n' "$session_name" "$session_id" "$session_cwd"
+  done
+  exit 0
+fi
+
+# the layout only makes sense in a fresh terminator; an open one already holds
+# its own windows, so add the missing sessions as tabs instead
+if [ "$mode" = "layout" ]; then
+  if [ ! -f "$LAYOUT_FILE" ]; then
+    echo "no layout at $LAYOUT_FILE — opening tabs"
+    mode="tabs"
+  elif pgrep -u "$USER" -x terminator >/dev/null; then
+    echo "terminator is already open — opening missing sessions as tabs"
+    mode="tabs"
+  fi
+fi
+
+opened=0
+skipped=0
+placed_ids=""
+
+if [ "$mode" = "layout" ] && ! placed_ids=$(cc-restore-layout "$SNAPSHOT_FILE" "$LAYOUT_FILE"); then
+  echo "could not build the layout — opening tabs"
+  mode="tabs"
+fi
+
+if [ "$mode" = "layout" ]; then
+  echo "layout saved at $(date -r "$LAYOUT_FILE" '+%F %T')"
+  terminator -l claude_restore >/dev/null 2>&1 &
+  sleep 3
+  opened=$(printf '%s' "$placed_ids" | grep -c . || true)
+  echo "layout restored with $opened session(s)"
+fi
+
+launcher_dir=$(mktemp -d /tmp/cc-restore.XXXXXX)
+tab_count=0
+
+for row in "${rows[@]}"; do
+  IFS=$'\t' read -r session_id session_cwd session_name <<<"$row"
+
+  # already opened inside the restored layout
+  if printf '%s\n' "$placed_ids" | grep -qx "$session_id"; then
+    continue
+  fi
+  if printf '%s\n' "$already_open" | grep -qx "$session_id"; then
+    echo "skip $session_name — already running"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if [ ! -d "$session_cwd" ]; then
+    echo "skip $session_name — directory is gone: $session_cwd"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  launcher="$launcher_dir/$session_id.sh"
+  cat > "$launcher" <<LAUNCHER
+cd "$session_cwd" || exit 1
+echo "resuming $session_name ($session_id)"
+claude --resume "$session_id"
+exec bash
+LAUNCHER
+
+  if [ "$mode" = "windows" ] || { [ "$mode" = "tabs" ] && [ "$tab_count" -eq 0 ]; }; then
+    terminator -T "$session_name" -e "bash $launcher" &
+    sleep 2
+  else
+    terminator --new-tab -T "$session_name" -e "bash $launcher"
+    sleep 1
+  fi
+  tab_count=$((tab_count + 1))
+  opened=$((opened + 1))
+done
+
+echo "opened $opened session(s)"
+send_notice "$opened 개 세션을 열었습니다. ($skipped 개는 건너뜀 — 이미 실행 중이거나 폴더 없음)"

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# cc-snapshot — record the currently open Claude Code sessions so they can be
+# reopened after a reboot with cc-restore.
+#   cc-snapshot           write the snapshot file
+#   cc-snapshot --print   print the open sessions as JSON, write nothing
+#   cc-snapshot --notify  also report the result as a desktop notification
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+SNAPSHOT_DIR="${CLAUDE_SESSIONS_DIR:-@SESSIONS_DIR@}"
+SNAPSHOT_FILE="$SNAPSHOT_DIR/open-sessions.json"
+REGISTRY_DIR="$HOME/.claude/sessions"
+NOTIFY_ICON="cc-session-restore"
+
+notify="no"
+[ "${1:-}" = "--notify" ] && notify="yes"
+
+send_notice() {
+  [ "$notify" = "yes" ] || return 0
+  command -v notify-send >/dev/null 2>&1 && notify-send -i "$NOTIFY_ICON" "Claude 세션" "$1"
+  # notification banners are turned off on this desktop, so show a window too
+  if [ "$(gsettings get org.gnome.desktop.notifications show-banners 2>/dev/null)" = "false" ] \
+     && command -v zenity >/dev/null 2>&1; then
+    zenity --info --title="Claude 세션" --text="$1" --width=360 --timeout=8 >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# the registry keeps one json per session; a file can outlive its process,
+# so keep only the interactive ones whose pid is still a running claude
+collect_open_sessions() {
+  local registry_file pid kind cmdline terminal_uuid
+  shopt -s nullglob
+  for registry_file in "$REGISTRY_DIR"/*.json; do
+    kind=$(jq -r '.kind // ""' "$registry_file" 2>/dev/null || echo "")
+    [ "$kind" = "interactive" ] || continue
+    pid=$(jq -r '.pid // 0' "$registry_file" 2>/dev/null || echo 0)
+    [ "$pid" -gt 0 ] 2>/dev/null || continue
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmdline" in *claude*) ;; *) continue ;; esac
+    # the terminator terminal this session runs in, matched against the layout by cc-restore
+    terminal_uuid=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^TERMINATOR_UUID=//p' || true)
+    jq --arg terminalUuid "$terminal_uuid" '{sessionId, cwd, name, pid, startedAt, terminalUuid: $terminalUuid}' "$registry_file"
+  done | jq -s 'sort_by(.startedAt)'
+}
+
+open_sessions=$(collect_open_sessions)
+count=$(printf '%s' "$open_sessions" | jq 'length')
+
+if [ "${1:-}" = "--print" ]; then
+  printf '%s\n' "$open_sessions"
+  exit 0
+fi
+
+# an empty result usually means claude is simply not running right now,
+# so keep the last good snapshot instead of wiping it
+if [ "$count" -eq 0 ]; then
+  echo "cc-snapshot: no open sessions, previous snapshot kept"
+  send_notice "열려 있는 세션이 없어 이전 기록을 그대로 두었습니다."
+  exit 0
+fi
+
+mkdir -p "$SNAPSHOT_DIR"
+[ -f "$SNAPSHOT_FILE" ] && cp "$SNAPSHOT_FILE" "$SNAPSHOT_FILE.prev"
+
+printf '%s' "$open_sessions" \
+  | jq --arg savedAt "$(date -Iseconds)" '{savedAt: $savedAt, sessions: .}' \
+  > "$SNAPSHOT_FILE"
+
+echo "cc-snapshot: saved $count session(s) -> $SNAPSHOT_FILE"
+send_notice "$count 개 세션을 기록했습니다."

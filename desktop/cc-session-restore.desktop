@@ -1,0 +1,29 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Claude 세션 복원
+GenericName=Claude Code Session Restore
+Comment=Reopen the Claude Code sessions that were open before the reboot
+Exec=bash -lc "@BIN_DIR@/cc-restore --notify >>@SESSIONS_DIR@/cc-restore.log 2>&1"
+Icon=cc-session-restore
+Terminal=false
+Categories=Utility;
+Keywords=claude;session;restore;resume;terminator;
+StartupNotify=true
+Actions=List;Tabs;Windows;Snapshot;
+
+[Desktop Action List]
+Name=열린 세션 목록 보기
+Exec=gnome-terminal -- bash -lc "@BIN_DIR@/cc-restore --list; echo; read -p '엔터를 누르면 닫힙니다 '"
+
+[Desktop Action Tabs]
+Name=레이아웃 없이 탭으로 열기
+Exec=bash -lc "@BIN_DIR@/cc-restore --tabs --notify >>@SESSIONS_DIR@/cc-restore.log 2>&1"
+
+[Desktop Action Windows]
+Name=탭 대신 창으로 열기
+Exec=bash -lc "@BIN_DIR@/cc-restore --windows --notify >>@SESSIONS_DIR@/cc-restore.log 2>&1"
+
+[Desktop Action Snapshot]
+Name=지금 세션 기록하기
+Exec=bash -lc "@BIN_DIR@/cc-snapshot --notify >>@SESSIONS_DIR@/cc-restore.log 2>&1"

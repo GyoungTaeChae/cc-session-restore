@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# cc-restore-layout — turn the layout saved by the terminator LayoutSnapshot plugin
+# into a terminator layout named "claude_restore" inside ~/.config/terminator/config.
+# Terminals that held a Claude session get "claude --resume <id>" as their command.
+# Prints the session ids it placed, one per line, so cc-restore can open the rest as tabs.
+#   cc-restore-layout <open-sessions.json> <terminator-layout.json>
+import json
+import os
+import shlex
+import shutil
+import sys
+
+from configobj import ConfigObj
+
+LAYOUT_NAME = 'claude_restore'
+TERMINATOR_CONFIG = os.path.expanduser('~/.config/terminator/config')
+
+
+def plain_uuid(uuid_text):
+    return uuid_text.replace('urn:uuid:', '')
+
+
+def main():
+    sessions_file, layout_file = sys.argv[1], sys.argv[2]
+    with open(sessions_file) as sessions_input:
+        sessions = json.load(sessions_input)['sessions']
+    with open(layout_file) as layout_input:
+        layout = json.load(layout_input)
+
+    session_by_terminal = {}
+    for session in sessions:
+        if session.get('terminalUuid'):
+            session_by_terminal[plain_uuid(session['terminalUuid'])] = session
+
+    placed_session_ids = []
+    for child in layout.values():
+        # a forced window title would stop the title from following the running program
+        if child['type'] == 'Window':
+            child.pop('title', None)
+        if child['type'] != 'Terminal':
+            continue
+        if child.get('directory') and not os.path.isdir(child['directory']):
+            del child['directory']
+        session = session_by_terminal.get(plain_uuid(child.get('uuid', '')))
+        if session is None or not os.path.isdir(session['cwd']):
+            continue
+        # claude --resume only works from the directory the session was started in
+        child['directory'] = session['cwd']
+        child['command'] = 'claude --resume %s; exec bash' % shlex.quote(session['sessionId'])
+        placed_session_ids.append(session['sessionId'])
+
+    if os.path.exists(TERMINATOR_CONFIG):
+        shutil.copy(TERMINATOR_CONFIG, TERMINATOR_CONFIG + '.bak-cc-restore')
+    config = ConfigObj(TERMINATOR_CONFIG, encoding='utf-8')
+    if 'layouts' not in config:
+        config['layouts'] = {}
+    config['layouts'][LAYOUT_NAME] = layout
+    config.write()
+
+    for session_id in placed_session_ids:
+        print(session_id)
+
+
+if __name__ == '__main__':
+    main()

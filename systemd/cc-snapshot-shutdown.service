@@ -1,0 +1,11 @@
+[Unit]
+Description=Record open Claude Code sessions on logout or shutdown
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=%h/.local/bin/cc-snapshot
+
+[Install]
+WantedBy=default.target
